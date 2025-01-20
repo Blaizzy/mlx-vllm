@@ -10,6 +10,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from ..base import BaseModel
 from .language import LanguageModel, TextConfig
 from .vision import VisionConfig, VisionModel
 
@@ -42,7 +43,7 @@ class ModelConfig:
         )
 
 
-class Model(nn.Module):
+class Model(BaseModel):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -54,6 +55,7 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         image_grid_thw: Optional[mx.array] = None,
+        **kwargs,
     ):
 
         if pixel_values is None:
@@ -66,12 +68,23 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Get the ouptut hidden states from the vision model
-        hidden_states = self.vision_tower(
-            pixel_values, image_grid_thw, output_hidden_states=False
+        hidden_states, all_attns = self.vision_tower(
+            pixel_values, image_grid_thw, output_hidden_states=False, output_attn=True
         )
 
         if hidden_states.ndim == 2:
             hidden_states = hidden_states[None, :, :]
+
+        if all_attns:
+            attn = all_attns[-1]
+            vision_filter_ratio = kwargs.get("vision_filter_ratio", 1.0)
+            vision_merge_ratio = kwargs.get("vision_merge_ratio", 1.0)
+            hidden_states = self.filter_topk_vision_tokens(
+                hidden_states, attn, vision_filter_ratio
+            )
+            hidden_states = self.merge_similar_vision_tokens(
+                hidden_states, vision_merge_ratio
+            )
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -83,13 +96,25 @@ class Model(nn.Module):
         self, image_features, inputs_embeds, input_ids
     ):
         image_token_index = self.config.image_token_index
+        num_images, num_image_patches, embed_dim = image_features.shape
 
         # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = input_ids == image_token_index
-        image_indices = np.where(image_positions)[1].tolist()
-        inputs_embeds[:, image_indices, :] = image_features
+        image_positions = np.where(input_ids[0] == image_token_index)[0].tolist()
 
-        return inputs_embeds
+        text_segments = []
+        start_idx = 0
+
+        for position in image_positions:
+            text_segments.append(inputs_embeds[:, start_idx:position])
+            start_idx = position + 1
+
+        image_embeddings = mx.split(image_features, image_features.shape[0])
+        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
+        final_embeddings += [inputs_embeds[:, start_idx:]]
+
+        # Create a final embedding of shape
+        # (1, num_image_patches*num_images + sequence_len, embed_dim)
+        return mx.concatenate(final_embeddings, axis=1)
 
     def __call__(
         self,
@@ -104,7 +129,7 @@ class Model(nn.Module):
             image_grid_thw = mx.array(image_grid_thw)
 
         input_embddings = self.get_input_embeddings(
-            input_ids, pixel_values, image_grid_thw
+            input_ids, pixel_values, image_grid_thw, **kwargs
         )
 
         logits = self.language_model(None, cache=cache, inputs_embeds=input_embddings)
